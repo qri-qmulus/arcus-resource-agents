@@ -1,0 +1,296 @@
+#!/bin/bash
+#
+#    OCF_RESKEY_os_tenant_id
+#    OCF_RESKEY_os_tenant_name
+#    OCF_RESKEY_os_auth_url
+#    OCF_RESKEY_os_username
+#    OCF_RESKEY_os_password
+#    OCF_RESKEY_os_cacert
+#    OCF_RESKEY_ip
+
+#######################################################################
+# Initialization:
+
+: ${OCF_FUNCTIONS_DIR=${OCF_ROOT}/lib/heartbeat}
+. ${OCF_FUNCTIONS_DIR}/ocf-shellfuncs
+INSTANCE_UUID_FILE="$HA_RSCTMP/instance-uuid.txt"
+
+
+#######################################################################
+
+meta_data() {
+	cat <<END
+<?xml version="1.0"?>
+<!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
+<resource-agent name="FloatingIP">
+<version>1.0</version>
+
+<longdesc lang="en">
+This RA is used to manage floating IP (IPv4) in OpenStack.
+VMs in a cluster can manage a floating IP.
+
+** Note **
+- VMs in cluster should not be associated any floating IP. The recommended
+  method to configure this RA is create another VM which is not in the
+  cluster and user it to connect to VMs in the cluster.
+</longdesc>
+
+<shortdesc lang="en">Manages OpenStack floating IP</shortdesc>
+
+<parameters>
+
+<parameter name="os_tenant_id" unique="1" required="1">
+<longdesc lang="en">
+OpenStack Tenant ID
+</longdesc>
+<shortdesc lang="en">OpenStack Tenant ID</shortdesc>
+<content type="string" default="" />
+</parameter>
+
+<parameter name="os_tenant_name" unique="1" required="1">
+<longdesc lang="en">
+OpenStack Tenant Name
+</longdesc>
+<shortdesc lang="en">OpenStack Tenant Name</shortdesc>
+<content type="string" default="" />
+</parameter>
+
+<parameter name="os_auth_url" unique="1" required="1">
+<longdesc lang="en">
+OpenStack Auth URL
+</longdesc>
+<shortdesc lang="en">OpenStack Auth URL</shortdesc>
+<content type="string" default="" />
+</parameter>
+
+<parameter name="os_username" unique="1" required="1">
+<longdesc lang="en">
+OpenStack Username
+</longdesc>
+<shortdesc lang="en">OpenStack Username</shortdesc>
+<content type="string" default="" />
+</parameter>
+
+<parameter name="os_password" unique="1" required="1">
+<longdesc lang="en">
+OpenStack Password
+</longdesc>
+<shortdesc lang="en">OpenStack Password</shortdesc>
+<content type="string" default="" />
+</parameter>
+
+<parameter name="os_cacert" unique="1" required="0">
+<longdesc lang="en">
+The CA file to be used. For example: "/home/ubuntu/myca.pem"
+</longdesc>
+<shortdesc lang="en">CA file location</shortdesc>
+<content type="string" default="" />
+</parameter>
+
+<parameter name="ip" unique="1" required="1">
+<longdesc lang="en">
+The floating IP to be used. For example: "172.16.19.99".
+The IP should be allocated to project before using this agent and user must
+make sure no one in the same project will use it.
+</longdesc>
+<shortdesc lang="en">floating IP address</shortdesc>
+<content type="string" default="" />
+</parameter>
+
+</parameters>
+<actions>
+<action name="start"   timeout="60s" />
+<action name="stop"    timeout="60s" />
+<action name="status" depth="0"  timeout="60s" interval="60s" />
+<action name="monitor" depth="0"  timeout="60s" interval="60s" />
+<action name="meta-data"  timeout="5s" />
+<action name="validate-all"  timeout="60s" />
+</actions>
+</resource-agent>
+END
+
+	exit $OCF_SUCCESS
+}
+
+
+fip_usage() {
+	cat <<END
+usage: $0 {start|stop|status|monitor|validate-all|meta-data}
+
+Expects to have a fully populated OCF RA-compliant environment set.
+END
+}
+
+
+_get_instance_uuid() {
+	# make curl silent, and exit within give guarantee time (5 seconds)
+	curl --silent --connect-timeout 5 --max-time 5 "http://169.254.169.254/openstack/latest/meta_data.json" | \
+	python -c 'import json,sys;print(json.load(sys.stdin)["uuid"])'
+}
+
+
+_get_floating_ip () {
+	# make curl silent, and exit within give guarantee time (5 seconds)
+	curl --silent --connect-timeout 5 --max-time 5 "http://169.254.169.254/latest/meta-data/public-ipv4"
+}
+
+
+fip_start () {
+	local cur_fip
+	local i
+
+	# make sure we don't have any Floating IP associated
+	cur_fip=$(_get_floating_ip)
+	if [ "x$cur_fip" != "x" ]; then
+		ocf_log err "Instance already has $cur_fip associated."
+		exit $OCF_ERR_GENERIC
+	fi
+
+	# do the association
+	$NOVACMD add-floating-ip $INSTANCE_UUID $OCF_RESKEY_ip
+	if [ $? -ne 0 ]; then
+		ocf_log err "Fail to associate $OCF_RESKEY_ip to instance."
+		exit $OCF_ERR_GENERIC
+	fi
+
+	# wait until floating IP OK
+	i=0
+	while true; do
+		cur_fip=$(_get_floating_ip)
+		if [ "x$cur_fip" = "x" ]; then
+			ocf_log info "Floating IP is not ready, retry..."
+			sleep 5
+			if [ $i -ge 10 ]; then
+				ocf_log err "Give up waiting Floating IP"
+				exit $OCF_ERR_GENERIC
+			fi
+			let i=i+1
+			continue
+		fi
+
+		if [ "$cur_fip" != "$OCF_RESKEY_ip" ]; then
+			ocf_log err "Instance's floating IP is not $OCF_RESKEY_ip."
+			exit $OCF_ERR_GENERIC
+		else
+			break
+		fi
+	done
+
+	exit $OCF_SUCCESS
+}
+
+
+fip_stop () {
+	local fip
+	local i
+
+	# do not disassociate if there is no fip
+	cur_fip=$(_get_floating_ip)
+	if [ "x$cur_fip" = "x" ]; then
+		ocf_log info "Instance has no floating IP."
+		exit $OCF_SUCCESS
+	fi
+
+	# do not disassociate a un-expected fip
+	if [ "$cur_fip" != "$OCF_RESKEY_ip" ]; then
+		ocf_log err "Instance has a floating IP ($cur_fip) than configured one."
+		exit $OCF_ERR_GENERIC
+	fi
+
+	$NOVACMD remove-floating-ip $INSTANCE_UUID $OCF_RESKEY_ip
+	if [ $? -ne 0 ]; then
+		exit $OCF_ERR_GENERIC
+	fi
+
+	# wait until floating IP gone
+	i=0
+	while true; do
+		cur_fip=$(_get_floating_ip)
+		if [ "x$cur_fip" != "x" ]; then
+			ocf_log info "Floating IP is still associated, retry..."
+			sleep 5
+			if [ $i -ge 10 ]; then
+				ocf_log err "Give up waiting floating IP"
+				exit $OCF_ERR_GENERIC
+			fi
+			let i=i+1
+			continue
+		else
+			break
+		fi
+	done
+
+	exit $OCF_SUCCESS
+}
+
+
+fip_monitor () {
+	local fip
+
+	fip=$(_get_floating_ip)
+	if [ "x$fip" = "x" ]; then
+		ocf_log info "Instance has no floating IP."
+		exit $OCF_NOT_RUNNING
+	fi
+
+	ocf_log info "Instance's floating IP is $fip"
+
+	if [ "$fip" != "$OCF_RESKEY_ip" ]; then
+		ocf_log err "Instance's floating IP is $fip rather than $OCF_RESKEY_ip"
+		exit $OCF_ERR_GENERIC
+	fi
+
+	exit $OCF_SUCCESS
+}
+
+
+fip_validate() {
+	which nova
+	if [ $? -ne 0 ]; then
+		ocf_log err "nova CLI is needed."
+		exit $OCF_ERR_INSTALLED
+	fi
+	exit $OCF_SUCCESS
+}
+
+
+case $__OCF_ACTION in
+meta-data)	meta_data
+		;;
+usage|help)	fip_usage
+		exit $OCF_SUCCESS
+		;;
+esac
+
+# nova command preprocess
+NOVACMD="nova --os-tenant-id ${OCF_RESKEY_os_tenant_id} \
+              --os-tenant-name ${OCF_RESKEY_os_tenant_name} \
+              --os-auth-url ${OCF_RESKEY_os_auth_url} \
+              --os-username ${OCF_RESKEY_os_username} \
+              --os-password ${OCF_RESKEY_os_password}"
+
+# if OCF_RESKEY_os_cacert is setted:
+if [[ -n "${OCF_RESKEY_os_cacert}" ]]; then
+	NOVACMD="$NOVACMD --os-cacert ${OCF_RESKEY_os_cacert}"
+fi
+
+# get instance UUID
+if [ ! -e $INSTANCE_UUID_FILE ]; then
+	echo -n $(_get_instance_uuid) > $INSTANCE_UUID_FILE
+fi
+INSTANCE_UUID=$(cat $INSTANCE_UUID_FILE)
+
+
+case $__OCF_ACTION in
+start)		fip_start
+		;;
+stop)		fip_stop
+		;;
+monitor)	fip_monitor
+		;;
+validate-all)	fip_validate
+		;;
+*)		fip_usage
+		exit $OCF_ERR_UNIMPLEMENTED
+		;;
+esac
